@@ -1,0 +1,170 @@
+# Atlas Quanta Configuration File
+
+# Data Sources Configuration
+data_sources:
+  # Stock Data
+  eod_historical:
+    api_key: "YOUR_EOD_API_KEY"
+    base_url: "https://eodhistoricaldata.com/api"
+    rate_limit: 20  # requests per minute
+  
+  iex_cloud:
+    api_key: "YOUR_IEX_API_KEY"
+    base_url: "https://cloud.iexapis.com/stable"
+    rate_limit: 100
+  
+  # Crypto Data
+  coingecko:
+    api_key: "YOUR_COINGECKO_API_KEY"
+    base_url: "https://api.coingecko.com/api/v3"
+    rate_limit: 30
+  
+  glassnode:
+    api_key: "YOUR_GLASSNODE_API_KEY"
+    base_url: "https://api.glassnode.com"
+    rate_limit: 60
+  
+  # Macro Data
+  fred:
+    api_key: "YOUR_FRED_API_KEY"
+    base_url: "https://api.stlouisfed.org/fred"
+  
+  # Sentiment Data
+  twitter:
+    bearer_token: "YOUR_TWITTER_BEARER_TOKEN"
+    rate_limit: 300
+  
+  reddit:
+    client_id: "YOUR_REDDIT_CLIENT_ID"
+    client_secret: "YOUR_REDDIT_CLIENT_SECRET"
+    user_agent: "atlas-quanta-1.0"
+  
+  news_api:
+    api_key: "YOUR_NEWS_API_KEY"
+    base_url: "https://newsapi.org/v2"
+
+# Model Configuration
+models:
+  # Investor Clustering
+  investor_clustering:
+    window_size: 252  # Trading days lookback
+    deviation_threshold: 2.0  # Sigma threshold for signals
+    min_cluster_size: 10
+    clustering_method: "kmeans"  # kmeans, dbscan, hierarchical
+    features: ["turnover", "position_change", "volume_ratio"]
+  
+  # VPIN (Volume-Synchronized Probability of Informed Trading)
+  vpin:
+    bucket_size: 50  # Volume per bucket
+    window_length: 50  # Sample window for VPIN calculation
+    update_frequency: "5min"  # Calculation frequency
+    imbalance_threshold: 0.3  # VPIN threshold for alerts
+  
+  # Sentiment Analysis
+  sentiment:
+    update_frequency: "1H"  # Update interval
+    smoothing_window: 24  # Hours for smoothing
+    sources: ["twitter", "reddit", "news"]
+    lexicon: "vader"  # vader, textblob, custom
+    threshold_extreme: 0.8  # Extreme sentiment threshold
+  
+  # Options Gamma
+  options_gamma:
+    expiry_threshold: 7  # Days to expiry for analysis
+    strike_range: 0.1  # Percentage range around current price
+    update_frequency: "15min"
+    gamma_threshold: 1000000  # Gamma exposure threshold
+  
+  # Regime Detection
+  regime_detection:
+    model_type: "msgarch"  # msgarch, hmm, markov
+    n_regimes: 3  # Number of market regimes
+    transition_prob_threshold: 0.7
+    lookback_window: 500  # Days for regime fitting
+
+# Prediction Settings
+prediction:
+  default_horizon: 30  # Days ahead
+  max_horizon: 100  # Maximum prediction horizon
+  confidence_levels: [0.05, 0.25, 0.75, 0.95]  # Prediction intervals
+  ensemble_methods: ["average", "weighted", "stacking"]
+  rebalance_frequency: "daily"  # Model update frequency
+
+# Risk Management
+risk_management:
+  max_position_size: 0.1  # 10% of portfolio
+  max_sector_exposure: 0.3  # 30% per sector
+  stop_loss: 0.05  # 5% stop loss
+  var_confidence: 0.05  # 5% VaR
+  stress_test_scenarios:
+    - "2008_crisis"
+    - "2020_covid"
+    - "flash_crash"
+    - "custom"
+
+# Database Configuration
+database:
+  type: "postgresql"  # postgresql, mysql, sqlite
+  host: "localhost"
+  port: 5432
+  database: "atlas_quanta"
+  username: "atlas_user"
+  password: "YOUR_DB_PASSWORD"
+  
+  # Redis for caching
+  redis:
+    host: "localhost"
+    port: 6379
+    db: 0
+    password: "YOUR_REDIS_PASSWORD"
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file_path: "logs/atlas_quanta.log"
+  max_file_size: "10MB"
+  backup_count: 5
+
+# Monitoring & Alerting
+monitoring:
+  mlflow:
+    tracking_uri: "http://localhost:5000"
+    experiment_name: "atlas_quanta_predictions"
+  
+  wandb:
+    project: "atlas-quanta"
+    entity: "your-wandb-entity"
+  
+  alerts:
+    slack_webhook: "YOUR_SLACK_WEBHOOK_URL"
+    email_notifications: true
+    email_recipients: ["admin@yourcompany.com"]
+    alert_thresholds:
+      prediction_error: 0.1  # 10% prediction error threshold
+      data_freshness: 3600  # 1 hour data staleness threshold
+      system_health: 0.95  # 95% uptime threshold
+
+# Performance Settings
+performance:
+  parallel_processing: true
+  n_jobs: -1  # Use all available cores
+  batch_size: 1000  # Batch size for data processing
+  cache_size: "1GB"  # Memory cache size
+  
+  # GPU settings (if available)
+  use_gpu: false
+  gpu_memory_limit: "4GB"
+
+# Development Settings
+development:
+  debug_mode: false
+  profiling: false
+  testing_mode: false
+  mock_data: false  # Use mock data for testing
+  
+  # Data sampling for development
+  sample_data:
+    enabled: false
+    sample_size: 1000
+    random_seed: 42
