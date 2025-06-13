@@ -1,0 +1,189 @@
+# Atlas Quanta - Multi-dimensional Market Prediction System
+# Docker Compose Configuration for Infrastructure Services
+
+version: '3.8'
+
+services:
+  # Apache Airflow - Data Pipeline Orchestration
+  airflow-webserver:
+    image: apache/airflow:2.8.1-python3.11
+    environment:
+      - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=81HqDtbqAywKSOumSHMpQs9s7t3uQBOPVA6_Qx4-o4o=
+      - AIRFLOW__WEBSERVER__SECRET_KEY=a25mQ1FHTUh2MV9XUVRjNWhlYjNZazJHSGl3NzVZX1JXV0hZVU5oQWM=
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./data:/opt/airflow/data
+    depends_on:
+      - postgres
+      - redis
+    command: >
+      bash -c "airflow db init && 
+               airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@atlas-quanta.com --password admin &&
+               airflow webserver"
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1-python3.11
+    environment:
+      - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=81HqDtbqAywKSOumSHMpQs9s7t3uQBOPVA6_Qx4-o4o=
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./data:/opt/airflow/data
+    depends_on:
+      - postgres
+      - redis
+    command: airflow scheduler
+
+  # MinIO - S3-Compatible Object Storage (Raw/Silver/Gold Data)
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=minio123
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # MinIO Client - Initialize buckets
+  minio-client:
+    image: minio/mc:RELEASE.2024-01-13T08-44-48Z
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 admin minio123) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/raw-zone --ignore-existing;
+      /usr/bin/mc mb minio/silver-zone --ignore-existing;
+      /usr/bin/mc mb minio/gold-zone --ignore-existing;
+      /usr/bin/mc mb minio/models --ignore-existing;
+      /usr/bin/mc mb minio/artifacts --ignore-existing;
+      echo 'MinIO buckets created successfully';
+      exit 0;
+      "
+
+  # DuckDB - Analytics Database
+  duckdb:
+    image: marcboeker/duckdb:v0.9.2
+    ports:
+      - "3000:3000"
+    volumes:
+      - duckdb_data:/data
+      - ./sql:/sql
+    environment:
+      - DUCKDB_DATABASE=/data/atlas_quanta.duckdb
+    command: >
+      sh -c "duckdb /data/atlas_quanta.duckdb -c '.read /sql/init_schema.sql' && 
+             tail -f /dev/null"
+
+  # MLflow - Model Management & Experiment Tracking
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    ports:
+      - "5000:5000"
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://mlflow:mlflow@postgres:5432/mlflow
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=s3://models/
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=minio123
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+    depends_on:
+      - postgres
+      - minio
+    command: >
+      sh -c "mlflow server 
+             --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow 
+             --default-artifact-root s3://models/ 
+             --host 0.0.0.0 
+             --port 5000"
+
+  # PostgreSQL - Metadata Database (Airflow & MLflow)
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_MULTIPLE_DATABASES=airflow,mlflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # Redis - Message Broker & Cache
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  # Streamlit - Dashboard Interface
+  streamlit:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.streamlit
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./data:/app/data
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      - minio
+      - duckdb
+      - redis
+    command: streamlit run src/dashboard/main.py --server.port=8501 --server.address=0.0.0.0
+
+  # FastAPI - Prediction API
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./data:/app/data
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      - minio
+      - duckdb
+      - redis
+      - mlflow
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  minio_data:
+  duckdb_data:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: atlas-quanta-network
