@@ -1,454 +1,446 @@
 """
-DMA (Dynamic Model Averaging) Implementation
+DMA (Dynamic Model Averaging) for Atlas Quanta
 
-Core Atlas Quanta technology achieving ~10% CRPS improvement over static models.
-Combines multiple models with time-varying weights based on predictive performance.
-
-Reference: Raftery, A. E., Kárný, M., & Ettler, P. (2010). Online prediction under model uncertainty
+This module implements Dynamic Model Averaging for combining multiple prediction models
+with time-varying weights based on their recent performance.
 """
 
-import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Callable, Any, Tuple
-from dataclasses import dataclass, field
-from abc import ABC, abstractmethod
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Union, Callable
+import logging
+from datetime import datetime
+from scipy.stats import norm, multivariate_normal
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
 import warnings
-from loguru import logger
-from collections import deque
+warnings.filterwarnings('ignore')
 
-
-@dataclass
-class DMAConfig:
-    """Configuration for Dynamic Model Averaging"""
-    forgetting_factor: float = 0.99
-    initial_weight: float = 1.0
-    min_weight: float = 0.001
-    max_models: int = 10
-    performance_window: int = 50
-    weight_smoothing: float = 0.95
-    
-
-@dataclass
-class ModelPrediction:
-    """Individual model prediction with metadata"""
-    model_name: str
-    prediction: np.ndarray
-    confidence: float
-    timestamp: pd.Timestamp
-    features_used: List[str] = field(default_factory=list)
-    
-
-class BaseModel(ABC):
-    """Abstract base class for models in DMA ensemble"""
-    
-    @abstractmethod
-    def fit(self, X: np.ndarray, y: np.ndarray) -> 'BaseModel':
-        """Fit the model"""
-        pass
-    
-    @abstractmethod
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Make predictions"""
-        pass
-    
-    @abstractmethod
-    def get_name(self) -> str:
-        """Get model name"""
-        pass
-
-
-class DynamicModelAveraging:
+class DMAModel:
     """
-    Dynamic Model Averaging for Multi-Model Prediction
+    Dynamic Model Averaging for adaptive ensemble forecasting.
     
-    This implementation follows Atlas Quanta methodology:
-    1. Maintain ensemble of heterogeneous models
-    2. Update model weights based on recent predictive performance
-    3. Handle model additions/removals dynamically
-    4. Provide uncertainty quantification
+    Combines multiple base models with time-varying weights that adapt
+    based on recent predictive performance and model uncertainty.
     """
     
-    def __init__(self, config: Optional[DMAConfig] = None):
+    def __init__(self, config: Dict = None):
         """
-        Initialize Dynamic Model Averaging
+        Initialize DMA model.
         
         Args:
-            config: DMA configuration parameters
+            config: Configuration dictionary with DMA parameters
         """
-        self.config = config or DMAConfig()
+        self.config = config or {}
+        self.logger = logging.getLogger(__name__)
         
-        # Model storage
-        self.models: Dict[str, BaseModel] = {}
-        self.model_weights: Dict[str, float] = {}
-        self.model_performance: Dict[str, deque] = {}
-        
-        # Prediction history
-        self.prediction_history: List[Dict] = []
-        self.actual_history: List[np.ndarray] = []
-        self.combined_predictions: List[np.ndarray] = []
+        # DMA configuration
+        self.forgetting_factor = self.config.get('forgetting_factor', 0.99)
+        self.include_predictions = self.config.get('include_predictions', True)
+        self.prediction_window = self.config.get('prediction_window', 20)
+        self.model_types = self.config.get('model_types', ['linear', 'ridge', 'random_forest'])
         
         # Performance tracking
-        self.weight_history: List[Dict[str, float]] = []
-        self.performance_metrics: Dict[str, Dict[str, float]] = {}
+        self.performance_window = self.config.get('performance_window', 50)
+        self.weight_smoothing = self.config.get('weight_smoothing', 0.1)
         
-        logger.info("Dynamic Model Averaging initialized")
+        # Storage
+        self.base_models = {}
+        self.model_weights = {}
+        self.model_performance = {}
+        self.prediction_history = {}
+        self.is_fitted = False
+        
+        # Initialize base models
+        self._initialize_base_models()
+        
+        self.logger.info(f"DMA model initialized with {len(self.base_models)} base models")
     
-    def add_model(self, model: BaseModel, initial_weight: Optional[float] = None) -> None:
-        """
-        Add a model to the ensemble
-        
-        Args:
-            model: Model instance implementing BaseModel interface
-            initial_weight: Initial weight for the model
-        """
-        model_name = model.get_name()
-        
-        if model_name in self.models:
-            logger.warning(f"Model {model_name} already exists, replacing")
-        
-        self.models[model_name] = model
-        self.model_weights[model_name] = initial_weight or self.config.initial_weight
-        self.model_performance[model_name] = deque(maxlen=self.config.performance_window)
-        
-        # Initialize performance metrics
-        self.performance_metrics[model_name] = {
-            'mse': float('inf'),
-            'mae': float('inf'),
-            'directional_accuracy': 0.5,
-            'cumulative_log_score': 0.0
+    def _initialize_base_models(self) -> None:
+        """Initialize the base models for ensemble."""
+        model_configs = {
+            'linear': LinearRegression(),
+            'ridge': Ridge(alpha=1.0),
+            'lasso': Lasso(alpha=0.1),
+            'random_forest': RandomForestRegressor(
+                n_estimators=50, 
+                max_depth=5, 
+                random_state=42
+            ),
+            'svr': SVR(kernel='rbf', gamma='scale')
         }
         
-        logger.info(f"Added model: {model_name} with weight {self.model_weights[model_name]:.4f}")
+        for model_type in self.model_types:
+            if model_type in model_configs:
+                self.base_models[model_type] = {
+                    'model': model_configs[model_type],
+                    'fitted': False,
+                    'last_performance': 0.0
+                }
+                self.model_weights[model_type] = 1.0 / len(self.model_types)
+                self.model_performance[model_type] = []
+                self.prediction_history[model_type] = []
     
-    def remove_model(self, model_name: str) -> None:
+    def fit(self, 
+            data: pd.DataFrame,
+            target_col: str,
+            feature_cols: List[str] = None) -> Dict[str, any]:
         """
-        Remove a model from the ensemble
+        Fit the DMA model and all base models.
         
         Args:
-            model_name: Name of model to remove
-        """
-        if model_name not in self.models:
-            logger.warning(f"Model {model_name} not found")
-            return
-        
-        del self.models[model_name]
-        del self.model_weights[model_name]
-        del self.model_performance[model_name]
-        del self.performance_metrics[model_name]
-        
-        logger.info(f"Removed model: {model_name}")
-    
-    def _normalize_weights(self) -> None:
-        """
-        Normalize model weights to sum to 1
-        """
-        total_weight = sum(self.model_weights.values())
-        
-        if total_weight > 0:
-            for model_name in self.model_weights:
-                self.model_weights[model_name] /= total_weight
-        else:
-            # Equal weights if all are zero
-            n_models = len(self.model_weights)
-            for model_name in self.model_weights:
-                self.model_weights[model_name] = 1.0 / n_models
-    
-    def _calculate_prediction_score(self, 
-                                  prediction: np.ndarray, 
-                                  actual: np.ndarray) -> float:
-        """
-        Calculate predictive score for weight updating
-        
-        Args:
-            prediction: Model prediction
-            actual: Actual values
+            data: Training data DataFrame
+            target_col: Name of target variable column
+            feature_cols: List of feature column names
             
         Returns:
-            Predictive score (higher is better)
+            Dictionary with fitting results
         """
-        # Mean squared error (convert to score)
-        mse = np.mean((prediction - actual) ** 2)
+        self.logger.info(f"Fitting DMA model on {len(data)} observations")
         
-        # Log score (Gaussian assumption)
-        # Assume prediction variance is proportional to recent MSE
-        recent_mse = np.mean([p for p in self.model_performance.get('recent_mse', [1.0])])
-        variance = max(recent_mse, 1e-6)
+        if feature_cols is None:
+            feature_cols = [col for col in data.columns if col != target_col]
         
-        # Gaussian log-likelihood
-        log_score = -0.5 * (np.log(2 * np.pi * variance) + mse / variance)
+        # Prepare data
+        X = data[feature_cols].dropna()
+        y = data[target_col].loc[X.index]
         
-        return float(log_score)
-    
-    def _update_model_weights(self, 
-                            model_predictions: Dict[str, np.ndarray],
-                            actual: np.ndarray) -> None:
-        """
-        Update model weights based on recent performance
+        if len(X) < 20:
+            raise ValueError("Insufficient data for DMA fitting")
         
-        Args:
-            model_predictions: Dictionary of model predictions
-            actual: Actual observed values
-        """
-        # Calculate prediction scores for each model
-        model_scores = {}
+        self.target_col = target_col
+        self.feature_cols = feature_cols
         
-        for model_name, prediction in model_predictions.items():
-            score = self._calculate_prediction_score(prediction, actual)
-            model_scores[model_name] = score
-            
-            # Update performance history
-            self.model_performance[model_name].append(score)
+        # Fit base models
+        fit_results = {}
         
-        # Update weights using exponential weighting
-        for model_name in self.model_weights:
-            if model_name in model_scores:
-                # Performance-based weight update
-                current_score = model_scores[model_name]
-                avg_score = np.mean(list(self.model_performance[model_name]))
-                
-                # Exponential update with forgetting
-                old_weight = self.model_weights[model_name]
-                performance_factor = np.exp(current_score - avg_score)
-                
-                new_weight = (
-                    self.config.forgetting_factor * old_weight * performance_factor +
-                    (1 - self.config.forgetting_factor) * self.config.initial_weight
-                )
-                
-                # Apply bounds
-                self.model_weights[model_name] = max(new_weight, self.config.min_weight)
-            else:
-                # Decay weight if model didn't produce prediction
-                self.model_weights[model_name] *= self.config.forgetting_factor
-        
-        # Normalize weights
-        self._normalize_weights()
-        
-        # Apply weight smoothing
-        if self.weight_history:
-            last_weights = self.weight_history[-1]
-            for model_name in self.model_weights:
-                if model_name in last_weights:
-                    current = self.model_weights[model_name]
-                    previous = last_weights[model_name]
-                    self.model_weights[model_name] = (
-                        self.config.weight_smoothing * previous +
-                        (1 - self.config.weight_smoothing) * current
-                    )
-        
-        # Store weight history
-        self.weight_history.append(self.model_weights.copy())
-    
-    def fit(self, X: np.ndarray, y: np.ndarray) -> 'DynamicModelAveraging':
-        """
-        Fit all models in the ensemble
-        
-        Args:
-            X: Feature matrix
-            y: Target values
-            
-        Returns:
-            Self for method chaining
-        """
-        logger.info(f"Fitting DMA ensemble with {len(self.models)} models")
-        
-        for model_name, model in self.models.items():
+        for model_name, model_info in self.base_models.items():
             try:
-                logger.info(f"Fitting model: {model_name}")
+                model = model_info['model']
                 model.fit(X, y)
+                model_info['fitted'] = True
+                
+                # Calculate in-sample performance
+                y_pred = model.predict(X)
+                mse = np.mean((y - y_pred) ** 2)
+                mae = np.mean(np.abs(y - y_pred))
+                
+                fit_results[model_name] = {
+                    'mse': mse,
+                    'mae': mae,
+                    'fitted': True
+                }
+                
+                self.logger.debug(f"Model {model_name} fitted successfully")
+                
             except Exception as e:
-                logger.error(f"Error fitting model {model_name}: {e}")
-                # Remove problematic model
-                self.remove_model(model_name)
+                self.logger.error(f"Error fitting model {model_name}: {e}")
+                model_info['fitted'] = False
+                fit_results[model_name] = {'fitted': False, 'error': str(e)}
         
-        logger.info("DMA ensemble fitting completed")
-        return self
+        # Initialize equal weights for fitted models
+        fitted_models = [name for name, info in self.base_models.items() if info['fitted']]
+        if fitted_models:
+            equal_weight = 1.0 / len(fitted_models)
+            for model_name in self.base_models:
+                self.model_weights[model_name] = equal_weight if model_name in fitted_models else 0.0
+        
+        self.is_fitted = True
+        self.logger.info(f"DMA fitting completed. {len(fitted_models)} models ready.")
+        
+        return {
+            'fitted_models': fitted_models,
+            'model_results': fit_results,
+            'initial_weights': self.model_weights.copy()
+        }
     
-    def predict(self, X: np.ndarray, return_individual: bool = False) -> Dict[str, Any]:
+    def predict(self, 
+                data: pd.DataFrame,
+                horizon: int = 1,
+                update_weights: bool = True) -> Dict[str, any]:
         """
-        Generate ensemble prediction using dynamic weights
+        Generate predictions using dynamic model averaging.
         
         Args:
-            X: Feature matrix for prediction
-            return_individual: Whether to return individual model predictions
+            data: Input data for prediction
+            horizon: Number of periods to forecast
+            update_weights: Whether to update model weights based on recent performance
             
         Returns:
-            Dictionary with ensemble prediction and metadata
+            Dictionary with predictions and weight evolution
         """
-        if not self.models:
-            raise ValueError("No models available for prediction")
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before prediction")
         
-        # Get predictions from all models
+        self.logger.info(f"Generating DMA predictions for {horizon} periods")
+        
+        # Prepare features
+        X = data[self.feature_cols].dropna()
+        if len(X) == 0:
+            raise ValueError("No valid feature data for prediction")
+        
+        # Generate predictions from each base model
         model_predictions = {}
-        prediction_confidence = {}
+        prediction_uncertainties = {}
         
-        for model_name, model in self.models.items():
+        for model_name, model_info in self.base_models.items():
+            if not model_info['fitted']:
+                continue
+                
             try:
-                pred = model.predict(X)
-                model_predictions[model_name] = pred
+                model = model_info['model']
                 
-                # Simple confidence based on recent performance
-                recent_scores = list(self.model_performance[model_name])
-                confidence = np.exp(np.mean(recent_scores)) if recent_scores else 0.5
-                prediction_confidence[model_name] = confidence
-                
+                if horizon == 1:
+                    # Single-step prediction
+                    pred = model.predict(X.tail(1))
+                    model_predictions[model_name] = pred[0]
+                    
+                    # Estimate uncertainty (simplified)
+                    recent_errors = self._get_recent_errors(model_name)
+                    uncertainty = np.std(recent_errors) if recent_errors else 0.1
+                    prediction_uncertainties[model_name] = uncertainty
+                    
+                else:
+                    # Multi-step prediction (recursive)
+                    predictions = self._recursive_predict(model, X.tail(10), horizon)
+                    model_predictions[model_name] = predictions
+                    
+                    # Multi-step uncertainty (increases with horizon)
+                    base_uncertainty = 0.1
+                    uncertainty = base_uncertainty * np.sqrt(horizon)
+                    prediction_uncertainties[model_name] = uncertainty
+                    
             except Exception as e:
-                logger.warning(f"Model {model_name} prediction failed: {e}")
+                self.logger.error(f"Prediction error for model {model_name}: {e}")
                 continue
         
         if not model_predictions:
-            raise RuntimeError("No models produced valid predictions")
+            raise ValueError("No models available for prediction")
         
-        # Calculate weighted ensemble prediction
-        ensemble_prediction = np.zeros_like(list(model_predictions.values())[0])
-        total_weight = 0
+        # Update weights if requested and we have recent performance data
+        if update_weights:
+            self._update_model_weights(prediction_uncertainties)
         
-        for model_name, prediction in model_predictions.items():
-            weight = self.model_weights.get(model_name, 0)
-            ensemble_prediction += weight * prediction
-            total_weight += weight
+        # Combine predictions using current weights
+        if horizon == 1:
+            weighted_prediction = self._combine_predictions(
+                model_predictions, 
+                self.model_weights
+            )
+            
+            # Calculate ensemble uncertainty
+            ensemble_uncertainty = self._calculate_ensemble_uncertainty(
+                model_predictions,
+                prediction_uncertainties,
+                self.model_weights
+            )
+            
+            return {
+                'prediction': weighted_prediction,
+                'uncertainty': ensemble_uncertainty,
+                'model_predictions': model_predictions,
+                'model_weights': self.model_weights.copy(),
+                'model_uncertainties': prediction_uncertainties
+            }
+        else:
+            # Multi-step predictions
+            weighted_predictions = []
+            
+            for h in range(horizon):
+                step_predictions = {name: preds[h] if isinstance(preds, (list, np.ndarray)) else preds 
+                                  for name, preds in model_predictions.items()}
+                
+                weighted_pred = self._combine_predictions(step_predictions, self.model_weights)
+                weighted_predictions.append(weighted_pred)
+            
+            return {
+                'predictions': weighted_predictions,
+                'model_predictions': model_predictions,
+                'model_weights': self.model_weights.copy(),
+                'horizon': horizon
+            }
+    
+    def _recursive_predict(self, model, recent_data: pd.DataFrame, horizon: int) -> List[float]:
+        """
+        Generate multi-step predictions recursively.
+        
+        Args:
+            model: Fitted base model
+            recent_data: Recent feature data
+            horizon: Number of steps to predict
+            
+        Returns:
+            List of predictions
+        """
+        predictions = []
+        current_features = recent_data.iloc[-1:].copy()
+        
+        for h in range(horizon):
+            # Predict next step
+            pred = model.predict(current_features)[0]
+            predictions.append(pred)
+            
+            # Update features for next prediction
+            # This is a simplified approach - in practice, you'd have domain-specific logic
+            if 'lag_1' in current_features.columns:
+                current_features['lag_1'] = pred
+            
+            # Add some noise to prevent overly confident long-term predictions
+            if h > 0:
+                noise_std = 0.01 * np.sqrt(h + 1)
+                pred += np.random.normal(0, noise_std)
+        
+        return predictions
+    
+    def _get_recent_errors(self, model_name: str, window: int = 10) -> List[float]:
+        """
+        Get recent prediction errors for a model.
+        
+        Args:
+            model_name: Name of the model
+            window: Number of recent errors to return
+            
+        Returns:
+            List of recent prediction errors
+        """
+        if model_name in self.model_performance:
+            return self.model_performance[model_name][-window:]
+        return []
+    
+    def _update_model_weights(self, uncertainties: Dict[str, float]) -> None:
+        """
+        Update model weights based on recent performance and uncertainties.
+        
+        Args:
+            uncertainties: Dictionary of model uncertainties
+        """
+        # Calculate inverse uncertainty weights (lower uncertainty = higher weight)
+        inverse_uncertainties = {}
+        total_inverse_uncertainty = 0
+        
+        for model_name in self.base_models:
+            if model_name in uncertainties and uncertainties[model_name] > 0:
+                inv_unc = 1.0 / (uncertainties[model_name] + 1e-8)
+                inverse_uncertainties[model_name] = inv_unc
+                total_inverse_uncertainty += inv_unc
+        
+        if total_inverse_uncertainty > 0:
+            # Update weights using exponential smoothing
+            for model_name in self.base_models:
+                if model_name in inverse_uncertainties:
+                    new_weight = inverse_uncertainties[model_name] / total_inverse_uncertainty
+                    # Smooth weight updates
+                    self.model_weights[model_name] = (
+                        (1 - self.weight_smoothing) * self.model_weights[model_name] +
+                        self.weight_smoothing * new_weight
+                    )
+                else:
+                    # Decay weights for models without predictions
+                    self.model_weights[model_name] *= 0.9
+        
+        # Renormalize weights
+        total_weight = sum(self.model_weights.values())
+        if total_weight > 0:
+            for model_name in self.model_weights:
+                self.model_weights[model_name] /= total_weight
+    
+    def _combine_predictions(self, 
+                           predictions: Dict[str, float], 
+                           weights: Dict[str, float]) -> float:
+        """
+        Combine model predictions using weights.
+        
+        Args:
+            predictions: Dictionary of model predictions
+            weights: Dictionary of model weights
+            
+        Returns:
+            Weighted average prediction
+        """
+        weighted_sum = 0.0
+        total_weight = 0.0
+        
+        for model_name, prediction in predictions.items():
+            if model_name in weights and weights[model_name] > 0:
+                weight = weights[model_name]
+                weighted_sum += weight * prediction
+                total_weight += weight
         
         if total_weight > 0:
-            ensemble_prediction /= total_weight
-        
-        # Calculate ensemble uncertainty
-        prediction_variance = np.zeros_like(ensemble_prediction)
-        
-        for model_name, prediction in model_predictions.items():
-            weight = self.model_weights.get(model_name, 0)
-            deviation = prediction - ensemble_prediction
-            prediction_variance += weight * (deviation ** 2)
-        
-        ensemble_std = np.sqrt(prediction_variance)
-        
-        # Prepare result
-        result = {
-            'prediction': ensemble_prediction,
-            'uncertainty': ensemble_std,
-            'weights': self.model_weights.copy(),
-            'n_models': len(model_predictions),
-            'total_weight': total_weight
-        }
-        
-        if return_individual:
-            result['individual_predictions'] = model_predictions
-            result['individual_confidence'] = prediction_confidence
-        
-        return result
+            return weighted_sum / total_weight
+        else:
+            # Fallback to simple average
+            return np.mean(list(predictions.values()))
     
-    def update(self, 
-              X: np.ndarray, 
-              y_actual: np.ndarray, 
-              retrain: bool = False) -> None:
+    def _calculate_ensemble_uncertainty(self,
+                                      predictions: Dict[str, float],
+                                      uncertainties: Dict[str, float],
+                                      weights: Dict[str, float]) -> float:
         """
-        Update the ensemble with new observations
+        Calculate ensemble prediction uncertainty.
         
         Args:
-            X: Feature matrix
-            y_actual: Actual observed values
-            retrain: Whether to retrain models
-        """
-        # Get predictions before updating
-        model_predictions = {}
-        
-        for model_name, model in self.models.items():
-            try:
-                pred = model.predict(X)
-                model_predictions[model_name] = pred
-            except Exception as e:
-                logger.warning(f"Model {model_name} prediction failed during update: {e}")
-        
-        # Update weights based on performance
-        if model_predictions:
-            self._update_model_weights(model_predictions, y_actual)
-        
-        # Store history
-        self.actual_history.append(y_actual)
-        
-        # Retrain models if requested
-        if retrain:
-            # This would require implementing online learning for individual models
-            logger.info("Model retraining requested but not implemented")
-    
-    def get_model_performance_summary(self) -> pd.DataFrame:
-        """
-        Get summary of model performance metrics
-        
-        Returns:
-            DataFrame with performance summary
-        """
-        summary_data = []
-        
-        for model_name in self.models.keys():
-            recent_scores = list(self.model_performance[model_name])
-            
-            if recent_scores:
-                summary_data.append({
-                    'model_name': model_name,
-                    'current_weight': self.model_weights[model_name],
-                    'avg_score': np.mean(recent_scores),
-                    'score_std': np.std(recent_scores),
-                    'min_score': np.min(recent_scores),
-                    'max_score': np.max(recent_scores),
-                    'n_predictions': len(recent_scores)
-                })
-            else:
-                summary_data.append({
-                    'model_name': model_name,
-                    'current_weight': self.model_weights[model_name],
-                    'avg_score': 0.0,
-                    'score_std': 0.0,
-                    'min_score': 0.0,
-                    'max_score': 0.0,
-                    'n_predictions': 0
-                })
-        
-        return pd.DataFrame(summary_data)
-    
-    def get_weight_evolution(self) -> pd.DataFrame:
-        """
-        Get evolution of model weights over time
-        
-        Returns:
-            DataFrame with weight evolution
-        """
-        if not self.weight_history:
-            return pd.DataFrame()
-        
-        weight_df = pd.DataFrame(self.weight_history)
-        weight_df.index.name = 'time_step'
-        
-        return weight_df
-    
-    def prune_models(self, min_weight_threshold: float = 0.01) -> List[str]:
-        """
-        Remove models with consistently low weights
-        
-        Args:
-            min_weight_threshold: Minimum weight threshold
+            predictions: Model predictions
+            uncertainties: Model uncertainties
+            weights: Model weights
             
         Returns:
-            List of removed model names
+            Ensemble uncertainty estimate
         """
-        removed_models = []
+        # Weighted average of individual uncertainties
+        weighted_uncertainty = 0.0
+        total_weight = 0.0
         
-        for model_name in list(self.models.keys()):
-            current_weight = self.model_weights[model_name]
-            
-            # Check recent weight history
-            recent_weights = []
-            for weights_dict in self.weight_history[-10:]:  # Last 10 periods
-                if model_name in weights_dict:
-                    recent_weights.append(weights_dict[model_name])
-            
-            avg_recent_weight = np.mean(recent_weights) if recent_weights else current_weight
-            
-            if avg_recent_weight < min_weight_threshold:
-                self.remove_model(model_name)
-                removed_models.append(model_name)
+        for model_name in predictions:
+            if model_name in weights and model_name in uncertainties:
+                weight = weights[model_name]
+                uncertainty = uncertainties[model_name]
+                weighted_uncertainty += weight * uncertainty ** 2
+                total_weight += weight
         
-        if removed_models:
-            logger.info(f"Pruned models: {removed_models}")
-            self._normalize_weights()
+        if total_weight > 0:
+            avg_uncertainty = np.sqrt(weighted_uncertainty / total_weight)
+        else:
+            avg_uncertainty = 0.1
         
-        return removed_models
+        # Add disagreement between models
+        if len(predictions) > 1:
+            pred_values = list(predictions.values())
+            disagreement = np.std(pred_values)
+            total_uncertainty = np.sqrt(avg_uncertainty ** 2 + disagreement ** 2)
+        else:
+            total_uncertainty = avg_uncertainty
+        
+        return total_uncertainty
+    
+    def get_model_rankings(self) -> pd.DataFrame:
+        """
+        Get current model rankings based on performance and weights.
+        
+        Returns:
+            DataFrame with model rankings
+        """
+        ranking_data = []
+        
+        for model_name, model_info in self.base_models.items():
+            if not model_info['fitted']:
+                continue
+            
+            recent_errors = self._get_recent_errors(model_name)
+            
+            ranking_data.append({
+                'model': model_name,
+                'weight': self.model_weights[model_name],
+                'recent_mse': np.mean([e**2 for e in recent_errors]) if recent_errors else np.inf,
+                'recent_mae': np.mean([abs(e) for e in recent_errors]) if recent_errors else np.inf,
+                'prediction_count': len(recent_errors),
+                'rank_score': self.model_weights[model_name] / (model_info['last_performance'] + 1e-8)
+            })
+        
+        df = pd.DataFrame(ranking_data)
+        if not df.empty:
+            df = df.sort_values('rank_score', ascending=False).reset_index(drop=True)
+            df['rank'] = df.index + 1
+        
+        return df
