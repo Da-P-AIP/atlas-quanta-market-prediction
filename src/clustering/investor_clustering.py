@@ -1,305 +1,434 @@
 """
-Investor Behavior Clustering Analysis
+Investor Clustering Module for Atlas Quanta
 
-Implements the core investor clustering methodology described in Atlas Quanta:
-- Permanent holding type (long-term oriented investors)
-- Fixed value trading type (price target achievers)
-- Panic type (news/rumor sensitive with panic selling)
-- Standard deviation deviation scoring for bottom/top detection
+Implements the core investor behavior clustering analysis based on deviation scoring.
+This module classifies investors into different behavioral types and calculates
+deviation scores for market timing signals.
 """
 
-import numpy as np
 import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Tuple
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-import warnings
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
-from loguru import logger
+import logging
+from datetime import datetime, timedelta
 
-
-@dataclass
-class InvestorCluster:
-    """Data class representing an investor cluster"""
-    cluster_id: int
-    name: str
-    description: str
-    characteristics: Dict[str, float]
-    current_deviation: float
-    historical_std: float
-    
-
-class InvestorClusteringAnalyzer:
+class InvestorClustering:
     """
-    Investor Behavior Clustering and Deviation Analysis
+    Investor behavior clustering and deviation analysis.
     
-    This class implements the core methodology for:
-    1. Clustering investors based on trading behavior patterns
+    This class implements the core logic for:
+    1. Clustering investors based on behavioral patterns
     2. Calculating deviation scores for each cluster
-    3. Generating market extreme signals (bottom/top detection)
+    3. Generating bottom/top signals from extreme deviations
     """
     
-    def __init__(self, window_size: int = 252, n_clusters: int = 3):
+    def __init__(self, config: Dict = None):
         """
-        Initialize the clustering analyzer
+        Initialize the investor clustering system.
         
         Args:
-            window_size: Rolling window for deviation calculation (trading days)
-            n_clusters: Number of investor clusters (default: 3)
+            config: Configuration dictionary with clustering parameters
         """
-        self.window_size = window_size
-        self.n_clusters = n_clusters
-        self.scaler = StandardScaler()
-        self.kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        self.clusters: List[InvestorCluster] = []
-        self.fitted = False
+        self.config = config or {}
+        self.logger = logging.getLogger(__name__)
         
-        # Cluster naming convention based on Atlas Quanta methodology
+        # Default configuration
+        self.n_clusters = self.config.get('n_clusters', 3)
+        self.lookback_window = self.config.get('lookback_window', 252)  # Trading days
+        self.deviation_threshold = self.config.get('deviation_threshold', 2.0)  # Sigma
+        
+        # Cluster names based on Atlas Quanta specification
         self.cluster_names = {
-            0: "Permanent Holding Type",
-            1: "Fixed Value Trading Type", 
-            2: "Panic Type"
+            0: 'permanent_hold',      # 恒久保有型
+            1: 'tactical_trading',    # 一定値売買型
+            2: 'panic_driven'         # 狼狽型
         }
         
-        self.cluster_descriptions = {
-            0: "Long-term oriented investors with stable holding patterns",
-            1: "Price target achievers who sell at predetermined levels",
-            2: "News/rumor sensitive investors prone to panic selling"
-        }
-    
-    def prepare_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Prepare feature matrix for clustering analysis
+        # Models and scalers
+        self.scaler = StandardScaler()
+        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
+        self.pca = PCA(n_components=0.95)  # Retain 95% variance
         
-        Expected columns in data:
-        - volume: Trading volume
-        - turnover_rate: Stock turnover rate
-        - holding_period: Average holding period
-        - price_volatility: Price volatility measure
-        - trade_frequency: Trading frequency
-        - position_change: Position change rate
+        # Historical data for deviation calculation
+        self.historical_features = {}
+        self.cluster_statistics = {}
+        
+        self.logger.info(f"Investor clustering initialized with {self.n_clusters} clusters")
+    
+    def fit_clusters(self, investor_data: pd.DataFrame) -> Dict[str, any]:
+        """
+        Fit clustering model on historical investor behavior data.
         
         Args:
-            data: DataFrame with investor behavior data
-            
+            investor_data: DataFrame with columns:
+                - turnover_rate: Trading frequency measure
+                - hold_period: Average holding period in days
+                - volatility_sensitivity: Reaction to market volatility
+                - news_sensitivity: Reaction to news events
+                - volume_ratio: Relative trading volume
+                
         Returns:
-            Feature matrix for clustering
+            Dictionary with clustering results and statistics
         """
-        logger.info("Preparing features for investor clustering")
+        self.logger.info(f"Fitting clusters on {len(investor_data)} observations")
         
-        features = pd.DataFrame()
+        # Feature engineering
+        features = self._engineer_features(investor_data)
         
-        # Core behavioral indicators
-        features['turnover_rate'] = data['turnover_rate']
-        features['holding_period'] = data['holding_period']
-        features['trade_frequency'] = data['trade_frequency']
-        features['volatility_response'] = data['price_volatility'] / data['volume']
-        features['position_stability'] = 1 / (1 + np.abs(data['position_change']))
-        
-        # Rolling statistics (momentum indicators)
-        features['turnover_ma'] = features['turnover_rate'].rolling(20).mean()
-        features['holding_trend'] = features['holding_period'].pct_change(10)
-        features['frequency_accel'] = features['trade_frequency'].diff(5)
-        
-        # News sensitivity proxy
-        if 'news_volume' in data.columns:
-            features['news_sensitivity'] = data['position_change'].abs() / (data['news_volume'] + 1)
-        else:
-            features['news_sensitivity'] = features['volatility_response']
-            
-        return features.fillna(method='ffill').fillna(0)
-    
-    def fit_clusters(self, data: pd.DataFrame) -> 'InvestorClusteringAnalyzer':
-        """
-        Fit clustering model to investor behavior data
-        
-        Args:
-            data: DataFrame with investor behavior features
-            
-        Returns:
-            Self for method chaining
-        """
-        logger.info(f"Fitting investor clusters with {len(data)} observations")
-        
-        # Prepare features
-        features = self.prepare_features(data)
-        
-        # Standardize features
+        # Scale features
         features_scaled = self.scaler.fit_transform(features)
         
-        # Fit clustering model
-        cluster_labels = self.kmeans.fit_predict(features_scaled)
+        # Apply PCA for dimensionality reduction
+        features_pca = self.pca.fit_transform(features_scaled)
         
-        # Create cluster objects with characteristics
-        self.clusters = []
-        for i in range(self.n_clusters):
-            cluster_mask = cluster_labels == i
-            cluster_data = features[cluster_mask]
-            
-            # Calculate cluster characteristics
-            characteristics = {
-                'avg_turnover': cluster_data['turnover_rate'].mean(),
-                'avg_holding_period': cluster_data['holding_period'].mean(),
-                'avg_trade_frequency': cluster_data['trade_frequency'].mean(),
-                'volatility_sensitivity': cluster_data['volatility_response'].mean(),
-                'position_stability': cluster_data['position_stability'].mean(),
-                'news_sensitivity': cluster_data['news_sensitivity'].mean()
-            }
-            
-            cluster = InvestorCluster(
-                cluster_id=i,
-                name=self.cluster_names.get(i, f"Cluster {i}"),
-                description=self.cluster_descriptions.get(i, f"Investor cluster {i}"),
-                characteristics=characteristics,
-                current_deviation=0.0,
-                historical_std=1.0
-            )
-            
-            self.clusters.append(cluster)
+        # Fit clustering
+        cluster_labels = self.kmeans.fit_predict(features_pca)
         
-        self.fitted = True
-        logger.info("Investor clustering completed successfully")
-        return self
+        # Store results
+        results = {
+            'cluster_labels': cluster_labels,
+            'cluster_centers': self.kmeans.cluster_centers_,
+            'features_original': features,
+            'features_scaled': features_scaled,
+            'features_pca': features_pca,
+            'explained_variance_ratio': self.pca.explained_variance_ratio_
+        }
+        
+        # Calculate cluster statistics
+        self.cluster_statistics = self._calculate_cluster_statistics(
+            investor_data, cluster_labels, features
+        )
+        
+        # Store historical features for deviation calculation
+        self.historical_features = features.copy()
+        
+        self.logger.info("Cluster fitting completed successfully")
+        return results
     
-    def calculate_deviation_scores(self, current_data: pd.DataFrame) -> Dict[str, float]:
+    def _engineer_features(self, data: pd.DataFrame) -> pd.DataFrame:
         """
-        Calculate current deviation scores for each investor cluster
-        
-        This is the core of the Atlas Quanta bottom/top detection methodology.
-        When deviation scores exceed ±2σ, it signals potential market extremes.
+        Engineer features for investor clustering.
         
         Args:
-            current_data: Current period investor behavior data
+            data: Raw investor behavior data
             
         Returns:
-            Dictionary of cluster deviation scores
+            Engineered features DataFrame
         """
-        if not self.fitted:
-            raise ValueError("Must fit clusters before calculating deviations")
+        features = pd.DataFrame(index=data.index)
+        
+        # Core behavioral features
+        features['turnover_rate'] = data.get('turnover_rate', 0)
+        features['hold_period_log'] = np.log1p(data.get('hold_period', 30))
+        features['volatility_beta'] = data.get('volatility_sensitivity', 1.0)
+        features['news_reaction_speed'] = data.get('news_sensitivity', 0.5)
+        features['relative_volume'] = data.get('volume_ratio', 1.0)
+        
+        # Derived features
+        features['trading_intensity'] = (
+            features['turnover_rate'] / (features['hold_period_log'] + 1)
+        )
+        features['stability_score'] = (
+            1 / (1 + features['volatility_beta'] * features['news_reaction_speed'])
+        )
+        features['momentum_tendency'] = (
+            features['turnover_rate'] * features['relative_volume']
+        )
+        
+        # Risk behavior features
+        features['panic_probability'] = (
+            features['news_reaction_speed'] * features['volatility_beta']
+        )
+        features['contrarian_score'] = 1 / (1 + features['momentum_tendency'])
+        
+        return features.fillna(features.median())
+    
+    def _calculate_cluster_statistics(self, 
+                                    original_data: pd.DataFrame,
+                                    cluster_labels: np.ndarray,
+                                    features: pd.DataFrame) -> Dict[int, Dict]:
+        """
+        Calculate statistical properties for each cluster.
+        
+        Args:
+            original_data: Original investor data
+            cluster_labels: Cluster assignment for each observation
+            features: Engineered features
             
-        logger.info("Calculating investor cluster deviation scores")
+        Returns:
+            Dictionary with statistics for each cluster
+        """
+        stats = {}
         
-        # Prepare current features
-        current_features = self.prepare_features(current_data)
+        for cluster_id in range(self.n_clusters):
+            mask = cluster_labels == cluster_id
+            cluster_data = features[mask]
+            
+            if len(cluster_data) == 0:
+                continue
+            
+            stats[cluster_id] = {
+                'name': self.cluster_names.get(cluster_id, f'cluster_{cluster_id}'),
+                'size': len(cluster_data),
+                'percentage': len(cluster_data) / len(features) * 100,
+                'mean_features': cluster_data.mean().to_dict(),
+                'std_features': cluster_data.std().to_dict(),
+                'characteristics': self._characterize_cluster(cluster_data)
+            }
+            
+        return stats
+    
+    def _characterize_cluster(self, cluster_data: pd.DataFrame) -> Dict[str, str]:
+        """
+        Generate human-readable characteristics for a cluster.
+        
+        Args:
+            cluster_data: Feature data for the cluster
+            
+        Returns:
+            Dictionary with cluster characteristics
+        """
+        characteristics = {}
+        
+        # Trading frequency
+        avg_turnover = cluster_data['turnover_rate'].mean()
+        if avg_turnover > 2.0:
+            characteristics['trading_style'] = 'High frequency trader'
+        elif avg_turnover > 0.5:
+            characteristics['trading_style'] = 'Active trader'
+        else:
+            characteristics['trading_style'] = 'Long-term holder'
+        
+        # Risk tolerance
+        avg_volatility_beta = cluster_data['volatility_beta'].mean()
+        if avg_volatility_beta > 1.5:
+            characteristics['risk_tolerance'] = 'High risk, volatile reactions'
+        elif avg_volatility_beta > 0.8:
+            characteristics['risk_tolerance'] = 'Moderate risk sensitivity'
+        else:
+            characteristics['risk_tolerance'] = 'Low risk, stable behavior'
+        
+        # News sensitivity
+        avg_news_sensitivity = cluster_data['news_reaction_speed'].mean()
+        if avg_news_sensitivity > 0.8:
+            characteristics['news_behavior'] = 'Highly reactive to news'
+        elif avg_news_sensitivity > 0.3:
+            characteristics['news_behavior'] = 'Moderately news-sensitive'
+        else:
+            characteristics['news_behavior'] = 'News-independent decisions'
+        
+        return characteristics
+    
+    def calculate_deviation_scores(self, 
+                                 current_data: pd.DataFrame,
+                                 reference_period_days: int = 60) -> Dict[str, float]:
+        """
+        Calculate deviation scores for current investor behavior.
+        
+        Args:
+            current_data: Current investor behavior data
+            reference_period_days: Period for calculating historical norms
+            
+        Returns:
+            Dictionary with deviation scores for each cluster
+        """
+        if self.historical_features.empty:
+            raise ValueError("No historical data available. Run fit_clusters first.")
+        
+        self.logger.info("Calculating deviation scores for current market conditions")
+        
+        # Engineer features for current data
+        current_features = self._engineer_features(current_data)
+        
+        # Predict cluster assignments for current data
         current_scaled = self.scaler.transform(current_features)
+        current_pca = self.pca.transform(current_scaled)
+        current_clusters = self.kmeans.predict(current_pca)
         
-        # Predict cluster assignments
-        cluster_assignments = self.kmeans.predict(current_scaled)
-        
+        # Calculate deviations for each cluster
         deviation_scores = {}
         
-        for i, cluster in enumerate(self.clusters):
-            # Get current period data for this cluster
-            cluster_mask = cluster_assignments == i
+        for cluster_id in range(self.n_clusters):
+            cluster_name = self.cluster_names.get(cluster_id, f'cluster_{cluster_id}')
             
-            if cluster_mask.sum() == 0:
-                deviation_scores[cluster.name] = 0.0
+            # Get current cluster data
+            current_mask = current_clusters == cluster_id
+            if not np.any(current_mask):
+                deviation_scores[f'{cluster_name}_deviation'] = 0.0
                 continue
+            
+            current_cluster_data = current_features[current_mask]
+            
+            # Get historical reference for this cluster
+            if cluster_id in self.cluster_statistics:
+                historical_means = pd.Series(
+                    self.cluster_statistics[cluster_id]['mean_features']
+                )
+                historical_stds = pd.Series(
+                    self.cluster_statistics[cluster_id]['std_features']
+                )
                 
-            current_cluster_data = current_features[cluster_mask]
-            
-            # Calculate key behavioral indicators
-            current_turnover = current_cluster_data['turnover_rate'].mean()
-            current_holding = current_cluster_data['holding_period'].mean()
-            current_frequency = current_cluster_data['trade_frequency'].mean()
-            
-            # Historical benchmarks (from fitted characteristics)
-            hist_turnover = cluster.characteristics['avg_turnover']
-            hist_holding = cluster.characteristics['avg_holding_period']
-            hist_frequency = cluster.characteristics['avg_trade_frequency']
-            
-            # Calculate deviation components
-            turnover_dev = (current_turnover - hist_turnover) / (hist_turnover + 1e-6)
-            holding_dev = (hist_holding - current_holding) / (hist_holding + 1e-6)  # Inverse for holding
-            frequency_dev = (current_frequency - hist_frequency) / (hist_frequency + 1e-6)
-            
-            # Composite deviation score (weighted average)
-            composite_deviation = (
-                0.4 * turnover_dev +
-                0.3 * holding_dev +
-                0.3 * frequency_dev
-            )
-            
-            # Convert to standard deviation units (approximate)
-            # In practice, this would use historical rolling standard deviation
-            standardized_deviation = composite_deviation / 0.2  # Rough approximation
-            
-            deviation_scores[cluster.name] = standardized_deviation
-            
-            # Update cluster with current deviation
-            cluster.current_deviation = standardized_deviation
+                # Calculate z-scores for key behavioral indicators
+                current_means = current_cluster_data.mean()
+                
+                # Focus on key deviation indicators
+                key_features = ['turnover_rate', 'volatility_beta', 'panic_probability']
+                z_scores = []
+                
+                for feature in key_features:
+                    if feature in current_means.index and historical_stds[feature] > 0:
+                        z_score = (
+                            (current_means[feature] - historical_means[feature]) /
+                            historical_stds[feature]
+                        )
+                        z_scores.append(z_score)
+                
+                # Aggregate deviation score
+                if z_scores:
+                    deviation_score = np.mean(np.abs(z_scores))
+                else:
+                    deviation_score = 0.0
+                
+                deviation_scores[f'{cluster_name}_deviation'] = deviation_score
+            else:
+                deviation_scores[f'{cluster_name}_deviation'] = 0.0
+        
+        # Generate market timing signals
+        signals = self._generate_timing_signals(deviation_scores)
+        deviation_scores.update(signals)
         
         return deviation_scores
     
-    def detect_market_extremes(self, deviation_scores: Dict[str, float], 
-                              threshold: float = 2.0) -> Dict[str, str]:
+    def _generate_timing_signals(self, deviation_scores: Dict[str, float]) -> Dict[str, any]:
         """
-        Detect potential market bottom/top signals based on cluster deviations
-        
-        Atlas Quanta methodology:
-        - Bottom signal: Multiple clusters showing extreme selling (deviation > +2σ)
-        - Top signal: Speculative clusters showing extreme buying while conservative clusters sell
+        Generate bottom/top signals from deviation scores.
         
         Args:
-            deviation_scores: Current deviation scores for each cluster
-            threshold: Standard deviation threshold for extreme signal
+            deviation_scores: Calculated deviation scores
             
         Returns:
-            Dictionary of market signals
+            Dictionary with timing signals
         """
         signals = {}
         
-        # Extract deviations by cluster type
-        permanent_dev = deviation_scores.get("Permanent Holding Type", 0)
-        trading_dev = deviation_scores.get("Fixed Value Trading Type", 0) 
-        panic_dev = deviation_scores.get("Panic Type", 0)
+        # Extract individual cluster deviations
+        permanent_dev = deviation_scores.get('permanent_hold_deviation', 0)
+        tactical_dev = deviation_scores.get('tactical_trading_deviation', 0)
+        panic_dev = deviation_scores.get('panic_driven_deviation', 0)
         
-        # Bottom detection logic
-        if (permanent_dev > threshold and panic_dev > threshold):
-            signals['market_signal'] = 'BOTTOM_CANDIDATE'
-            signals['confidence'] = min((permanent_dev + panic_dev) / (2 * threshold), 3.0)
-            signals['reasoning'] = "Even stable investors are selling heavily - potential exhaustion"
-            
-        # Top detection logic  
-        elif (panic_dev < -threshold and trading_dev < -threshold and permanent_dev > 0):
-            signals['market_signal'] = 'TOP_CANDIDATE'
-            signals['confidence'] = min(abs(panic_dev + trading_dev) / (2 * threshold), 3.0)
-            signals['reasoning'] = "Speculative buying while smart money exits"
-            
-        # Neutral/trending market
+        # Bottom signal logic (extreme selling)
+        # When even stable investors are selling heavily
+        bottom_signal_strength = 0
+        if permanent_dev > self.deviation_threshold and panic_dev > self.deviation_threshold:
+            bottom_signal_strength = min(5, (permanent_dev + panic_dev) / 2)
+        
+        # Top signal logic (extreme buying/complacency)
+        # When tactical traders are very active but fundamentals don't justify
+        top_signal_strength = 0
+        if tactical_dev > self.deviation_threshold and permanent_dev < 0.5:
+            top_signal_strength = min(5, tactical_dev - permanent_dev)
+        
+        signals.update({
+            'bottom_signal_strength': bottom_signal_strength,
+            'top_signal_strength': top_signal_strength,
+            'overall_market_stress': np.mean([permanent_dev, tactical_dev, panic_dev]),
+            'contrarian_opportunity': bottom_signal_strength - top_signal_strength
+        })
+        
+        # Signal interpretation
+        if bottom_signal_strength > 3:
+            signals['market_signal'] = 'STRONG_BOTTOM'
+        elif bottom_signal_strength > 2:
+            signals['market_signal'] = 'POTENTIAL_BOTTOM'
+        elif top_signal_strength > 3:
+            signals['market_signal'] = 'STRONG_TOP'
+        elif top_signal_strength > 2:
+            signals['market_signal'] = 'POTENTIAL_TOP'
         else:
             signals['market_signal'] = 'NEUTRAL'
-            signals['confidence'] = 0.5
-            signals['reasoning'] = "No extreme cluster behavior detected"
-        
-        # Add individual cluster signals
-        for cluster_name, deviation in deviation_scores.items():
-            if abs(deviation) > threshold:
-                direction = "EXTREME_SELL" if deviation > 0 else "EXTREME_BUY"
-                signals[f"{cluster_name}_signal"] = direction
         
         return signals
     
     def get_cluster_summary(self) -> pd.DataFrame:
         """
-        Get summary of all investor clusters and their characteristics
+        Get summary of cluster characteristics.
         
         Returns:
             DataFrame with cluster summary information
         """
-        if not self.fitted:
+        if not self.cluster_statistics:
             return pd.DataFrame()
-            
+        
         summary_data = []
-        for cluster in self.clusters:
-            row = {
-                'cluster_id': cluster.cluster_id,
-                'name': cluster.name,
-                'description': cluster.description,
-                'current_deviation': cluster.current_deviation,
-                **cluster.characteristics
-            }
-            summary_data.append(row)
-            
+        for cluster_id, stats in self.cluster_statistics.items():
+            summary_data.append({
+                'cluster_id': cluster_id,
+                'name': stats['name'],
+                'size': stats['size'],
+                'percentage': stats['percentage'],
+                'avg_turnover': stats['mean_features'].get('turnover_rate', 0),
+                'avg_hold_period': np.exp(stats['mean_features'].get('hold_period_log', 0)) - 1,
+                'volatility_sensitivity': stats['mean_features'].get('volatility_beta', 1),
+                'trading_style': stats['characteristics'].get('trading_style', 'Unknown'),
+                'risk_tolerance': stats['characteristics'].get('risk_tolerance', 'Unknown')
+            })
+        
         return pd.DataFrame(summary_data)
+
+    def generate_synthetic_investor_data(self, 
+                                       n_samples: int = 1000,
+                                       market_regime: str = 'normal') -> pd.DataFrame:
+        """
+        Generate synthetic investor behavior data for testing.
+        
+        Args:
+            n_samples: Number of samples to generate
+            market_regime: Market condition ('normal', 'stress', 'euphoria')
+            
+        Returns:
+            Synthetic investor behavior DataFrame
+        """
+        np.random.seed(42)  # For reproducible results
+        
+        # Base parameters by market regime
+        regime_params = {
+            'normal': {'vol_mult': 1.0, 'news_mult': 1.0, 'panic_mult': 1.0},
+            'stress': {'vol_mult': 2.0, 'news_mult': 1.5, 'panic_mult': 2.5},
+            'euphoria': {'vol_mult': 0.7, 'news_mult': 0.8, 'panic_mult': 0.5}
+        }
+        
+        params = regime_params.get(market_regime, regime_params['normal'])
+        
+        # Generate base features with regime adjustments
+        data = {
+            'turnover_rate': np.random.lognormal(
+                mean=-1, sigma=1, size=n_samples
+            ) * params['vol_mult'],
+            'hold_period': np.random.exponential(
+                scale=45, size=n_samples
+            ) / params['vol_mult'],
+            'volatility_sensitivity': np.random.gamma(
+                shape=2, scale=0.5, size=n_samples
+            ) * params['vol_mult'],
+            'news_sensitivity': np.random.beta(
+                a=2, b=3, size=n_samples
+            ) * params['news_mult'],
+            'volume_ratio': np.random.lognormal(
+                mean=0, sigma=0.3, size=n_samples
+            ) * params['panic_mult']
+        }
+        
+        df = pd.DataFrame(data)
+        
+        # Add timestamp
+        dates = pd.date_range(
+            start=datetime.now() - timedelta(days=n_samples),
+            periods=n_samples,
+            freq='D'
+        )
+        df.index = dates
+        
+        return df
