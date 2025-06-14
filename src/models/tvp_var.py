@@ -1,422 +1,588 @@
 """
-TVP-VAR (Time-Varying Parameter Vector Autoregression) Model Implementation
+TVP-VAR (Time-Varying Parameter Vector Autoregression) Model for Atlas Quanta
 
-Core Atlas Quanta technology achieving 5-12% error improvement over static VAR.
-This model adapts parameters dynamically to changing market conditions.
-
-Reference: Primiceri, G. E. (2005). Time varying structural vector autoregressions and monetary policy
+This module implements time-varying parameter VAR models for dynamic forecasting
+with adaptive parameter adjustment based on changing market conditions.
 """
 
-import numpy as np
 import pandas as pd
-from typing import Optional, Dict, List, Tuple, Union
-from dataclasses import dataclass
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Union
+import logging
+from datetime import datetime
 from scipy import linalg
-from scipy.stats import invgamma, multivariate_normal
-import warnings
-from loguru import logger
+from scipy.stats import invwishart, multivariate_normal
 from sklearn.preprocessing import StandardScaler
-
-
-@dataclass
-class TVPVARConfig:
-    """Configuration for TVP-VAR model"""
-    n_lags: int = 2
-    n_factors: int = 3
-    burnin: int = 1000
-    n_draws: int = 5000
-    prior_variance: float = 0.1
-    forgetting_factor: float = 0.99
-    initial_variance: float = 1.0
-    
-
-@dataclass
-class TVPVARResult:
-    """TVP-VAR estimation result"""
-    timestamp: pd.Timestamp
-    parameters: np.ndarray
-    variance_matrix: np.ndarray
-    log_likelihood: float
-    forecast: np.ndarray
-    forecast_variance: np.ndarray
-    regime_probability: float
-    
+import warnings
+warnings.filterwarnings('ignore')
 
 class TVPVARModel:
     """
-    Time-Varying Parameter Vector Autoregression Model
+    Time-Varying Parameter Vector Autoregression Model.
     
-    This implementation follows the Atlas Quanta methodology for dynamic market modeling:
-    1. Bayesian estimation with forgetting factors
-    2. Time-varying coefficients and error variances  
-    3. Real-time parameter adaptation
-    4. Multi-step ahead forecasting
+    Implements Bayesian TVP-VAR with stochastic volatility for dynamic
+    parameter estimation in financial time series forecasting.
     """
     
-    def __init__(self, config: Optional[TVPVARConfig] = None):
+    def __init__(self, config: Dict = None):
         """
-        Initialize TVP-VAR model
+        Initialize TVP-VAR model.
         
         Args:
-            config: Model configuration parameters
+            config: Configuration dictionary with model parameters
         """
-        self.config = config or TVPVARConfig()
-        self.scaler = StandardScaler()
+        self.config = config or {}
+        self.logger = logging.getLogger(__name__)
         
-        # Model state
-        self.n_vars = None
-        self.n_params = None
+        # Model configuration
+        self.lags = self.config.get('lags', 2)
+        self.n_draws = self.config.get('n_draws', 1000)
+        self.n_burn = self.config.get('n_burn', 200)
+        self.decay_factor = self.config.get('decay_factor', 0.99)
+        
+        # Hyperparameters for priors
+        self.kappa_beta = self.config.get('kappa_beta', 0.01)  # State equation variance
+        self.kappa_alpha = self.config.get('kappa_alpha', 0.01)  # Stochastic volatility
+        
+        # Model components
+        self.scaler = StandardScaler()
         self.is_fitted = False
         
-        # Parameter storage
-        self.parameter_history: List[np.ndarray] = []
-        self.variance_history: List[np.ndarray] = []
-        self.likelihood_history: List[float] = []
+        # Storage for model results
+        self.parameters = {}
+        self.volatility = {}
+        self.forecasts = {}
         
-        # Current state
-        self.current_parameters = None
-        self.current_variance = None
-        self.parameter_variance = None
-        
-        logger.info(f"TVP-VAR model initialized with {self.config.n_lags} lags")
+        self.logger.info(f"TVP-VAR model initialized with {self.lags} lags")
     
-    def _create_lagged_matrix(self, data: np.ndarray, n_lags: int) -> Tuple[np.ndarray, np.ndarray]:
+    def fit(self, data: pd.DataFrame, target_cols: List[str] = None) -> Dict[str, any]:
         """
-        Create lagged design matrix for VAR estimation
-        
-        Args:
-            data: Time series data (T x n_vars)
-            n_lags: Number of lags
-            
-        Returns:
-            (Y, X) where Y is dependent and X is lagged design matrix
-        """
-        T, n_vars = data.shape
-        
-        # Create dependent variable matrix (remove first n_lags observations)
-        Y = data[n_lags:, :]
-        
-        # Create lagged design matrix
-        X = np.ones((T - n_lags, 1))  # Constant term
-        
-        for lag in range(1, n_lags + 1):
-            X_lag = data[n_lags - lag:T - lag, :]
-            X = np.hstack([X, X_lag])
-        
-        return Y, X
-    
-    def _initialize_parameters(self, X: np.ndarray, Y: np.ndarray) -> None:
-        """
-        Initialize model parameters using OLS estimates
-        
-        Args:
-            X: Design matrix
-            Y: Dependent variable matrix
-        """
-        self.n_vars = Y.shape[1]
-        self.n_params = X.shape[1]
-        
-        # OLS initialization
-        try:
-            beta_ols = np.linalg.solve(X.T @ X, X.T @ Y)
-            residuals = Y - X @ beta_ols
-            sigma_ols = (residuals.T @ residuals) / (X.shape[0] - self.n_params)
-            
-            # Initialize time-varying parameters
-            self.current_parameters = beta_ols.flatten()
-            self.current_variance = sigma_ols
-            
-            # Parameter evolution variance (small initial values)
-            self.parameter_variance = np.eye(self.n_params * self.n_vars) * self.config.prior_variance
-            
-        except np.linalg.LinAlgError:
-            logger.warning("OLS initialization failed, using random initialization")
-            self.current_parameters = np.random.normal(0, 0.1, self.n_params * self.n_vars)
-            self.current_variance = np.eye(self.n_vars) * self.config.initial_variance
-            self.parameter_variance = np.eye(self.n_params * self.n_vars) * self.config.prior_variance
-    
-    def _kalman_filter_step(self, y_t: np.ndarray, x_t: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
-        """
-        Single Kalman filter step for parameter updating
-        
-        Args:
-            y_t: Current observation vector
-            x_t: Current design vector
-            
-        Returns:
-            (updated_parameters, updated_variance, log_likelihood)
-        """
-        # Prediction step
-        beta_pred = self.current_parameters
-        P_pred = self.parameter_variance / self.config.forgetting_factor
-        
-        # Design matrix for current observation
-        H_t = np.kron(x_t.reshape(1, -1), np.eye(self.n_vars))
-        
-        # Prediction error
-        y_pred = H_t @ beta_pred
-        error = y_t - y_pred
-        
-        # Error covariance
-        S_t = H_t @ P_pred @ H_t.T + self.current_variance
-        
-        # Kalman gain
-        try:
-            K_t = P_pred @ H_t.T @ np.linalg.inv(S_t)
-        except np.linalg.LinAlgError:
-            K_t = P_pred @ H_t.T @ np.linalg.pinv(S_t)
-        
-        # Update step
-        beta_updated = beta_pred + K_t @ error
-        P_updated = (np.eye(len(beta_pred)) - K_t @ H_t) @ P_pred
-        
-        # Log-likelihood
-        log_likelihood = -0.5 * (np.log(np.linalg.det(S_t)) + error.T @ np.linalg.inv(S_t) @ error)
-        
-        return beta_updated, P_updated, float(log_likelihood)
-    
-    def fit(self, data: pd.DataFrame) -> 'TVPVARModel':
-        """
-        Fit TVP-VAR model to data
+        Fit the TVP-VAR model on historical data.
         
         Args:
             data: DataFrame with time series data
+            target_cols: List of column names to use as endogenous variables
             
         Returns:
-            Self for method chaining
+            Dictionary with fitting results and diagnostics
         """
-        logger.info(f"Fitting TVP-VAR model on {len(data)} observations")
+        self.logger.info(f"Fitting TVP-VAR model on {len(data)} observations")
+        
+        if target_cols is None:
+            target_cols = data.select_dtypes(include=[np.number]).columns.tolist()
         
         # Prepare data
-        data_array = self.scaler.fit_transform(data.values)
-        Y, X = self._create_lagged_matrix(data_array, self.config.n_lags)
+        y = data[target_cols].dropna()
+        if len(y) < self.lags + 10:
+            raise ValueError(f"Insufficient data: need at least {self.lags + 10} observations")
         
-        # Initialize parameters
-        self._initialize_parameters(X, Y)
+        # Scale data
+        y_scaled = pd.DataFrame(
+            self.scaler.fit_transform(y),
+            index=y.index,
+            columns=y.columns
+        )
         
-        # Clear history
-        self.parameter_history = []
-        self.variance_history = []
-        self.likelihood_history = []
+        # Create lagged variables
+        Y, X = self._create_var_matrices(y_scaled)
         
-        # Sequential estimation using Kalman filter
-        total_likelihood = 0
+        # Estimate model using Kalman Filter with time-varying parameters
+        results = self._estimate_tvp_var(Y, X)
         
-        for t in range(Y.shape[0]):
+        # Store results
+        self.n_vars = Y.shape[1]
+        self.n_obs = Y.shape[0]
+        self.target_columns = target_cols
+        self.parameters = results['parameters']
+        self.volatility = results['volatility']
+        self.log_likelihood = results['log_likelihood']
+        self.is_fitted = True
+        
+        # Calculate model diagnostics
+        diagnostics = self._calculate_diagnostics(Y, X, results)
+        
+        self.logger.info("TVP-VAR model fitting completed successfully")
+        return {
+            'parameters': results['parameters'],
+            'volatility': results['volatility'],
+            'diagnostics': diagnostics,
+            'log_likelihood': results['log_likelihood']
+        }
+    
+    def _create_var_matrices(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create VAR matrices Y and X from time series data.
+        
+        Args:
+            data: Time series DataFrame
+            
+        Returns:
+            Tuple of (Y, X) matrices for VAR estimation
+        """
+        n_obs, n_vars = data.shape
+        
+        # Create Y matrix (dependent variables)
+        Y = data.iloc[self.lags:].values
+        
+        # Create X matrix (lagged variables + constant)
+        X_list = []
+        
+        # Add constant
+        X_list.append(np.ones((n_obs - self.lags, 1)))
+        
+        # Add lagged variables
+        for lag in range(1, self.lags + 1):
+            lagged_data = data.iloc[self.lags - lag:-lag].values
+            X_list.append(lagged_data)
+        
+        X = np.hstack(X_list)
+        
+        return Y, X
+    
+    def _estimate_tvp_var(self, Y: np.ndarray, X: np.ndarray) -> Dict[str, any]:
+        """
+        Estimate TVP-VAR using Kalman Filter with time-varying parameters.
+        
+        Args:
+            Y: Dependent variable matrix
+            X: Independent variable matrix (including lags)
+            
+        Returns:
+            Dictionary with parameter estimates and volatility
+        """
+        T, n = Y.shape
+        k = X.shape[1]  # Number of regressors per equation
+        
+        # Initialize parameter storage
+        beta_mean = np.zeros((T, n * k))  # Vectorized parameters
+        beta_var = np.zeros((T, n * k, n * k))
+        h_mean = np.zeros((T, n))  # Log volatilities
+        sigma = np.zeros((T, n, n))  # Covariance matrices
+        
+        # Prior specifications
+        beta_0_mean = np.zeros(n * k)
+        beta_0_var = np.eye(n * k) * 10  # Diffuse prior
+        h_0_mean = np.zeros(n)
+        h_0_var = np.eye(n) * 10
+        
+        # Hyperparameters
+        Q_beta = np.eye(n * k) * self.kappa_beta  # State evolution covariance
+        Q_h = np.eye(n) * self.kappa_alpha  # Volatility evolution covariance
+        
+        # Initialize
+        beta_mean[0] = beta_0_mean
+        beta_var[0] = beta_0_var
+        h_mean[0] = h_0_mean
+        
+        log_likelihood = 0
+        
+        # Kalman Filter loop
+        for t in range(T):
+            # Current observation
             y_t = Y[t, :]
             x_t = X[t, :]
             
-            # Kalman filter update
-            beta_new, P_new, ll_t = self._kalman_filter_step(y_t, x_t)
+            # Create design matrix for vectorized system
+            X_t = np.kron(np.eye(n), x_t.reshape(1, -1))
             
-            # Update current state
-            self.current_parameters = beta_new
-            self.parameter_variance = P_new
-            
-            # Store history
-            self.parameter_history.append(beta_new.copy())
-            self.variance_history.append(self.current_variance.copy())
-            self.likelihood_history.append(ll_t)
-            
-            total_likelihood += ll_t
-            
-            # Update error covariance (simple exponential smoothing)
-            if t > 0:
-                residual = y_t - X[t, :] @ beta_new.reshape(self.n_params, self.n_vars)
-                self.current_variance = (
-                    self.config.forgetting_factor * self.current_variance + 
-                    (1 - self.config.forgetting_factor) * np.outer(residual, residual)
-                )
-        
-        self.is_fitted = True
-        avg_likelihood = total_likelihood / Y.shape[0]
-        
-        logger.info(f"TVP-VAR model fitted successfully. Avg log-likelihood: {avg_likelihood:.4f}")
-        return self
-    
-    def predict(self, 
-               steps_ahead: int = 1, 
-               confidence_level: float = 0.95) -> Dict[str, np.ndarray]:
-        """
-        Generate multi-step ahead forecasts
-        
-        Args:
-            steps_ahead: Number of periods to forecast
-            confidence_level: Confidence level for intervals
-            
-        Returns:
-            Dictionary with forecasts and confidence intervals
-        """
-        if not self.is_fitted:
-            raise ValueError("Model must be fitted before making predictions")
-        
-        # Current parameter estimates
-        beta_current = self.current_parameters.reshape(self.n_params, self.n_vars)
-        
-        # Initialize forecast arrays
-        forecasts = np.zeros((steps_ahead, self.n_vars))
-        forecast_variances = np.zeros((steps_ahead, self.n_vars, self.n_vars))
-        
-        # Last observations for lagged terms
-        last_data = np.zeros((self.config.n_lags, self.n_vars))
-        if hasattr(self, '_last_observations'):
-            last_data = self._last_observations
-        
-        # Multi-step forecasting
-        for h in range(steps_ahead):
-            # Create design vector
-            if h == 0:
-                x_h = np.concatenate([np.array([1]), last_data.flatten()])
+            if t == 0:
+                # Initial prediction
+                beta_pred = beta_0_mean
+                P_pred = beta_0_var
+                h_pred = h_0_mean
             else:
-                # Use previous forecasts for multi-step
-                if h <= self.config.n_lags:
-                    recent_data = np.vstack([last_data[h:], forecasts[:h]])
-                else:
-                    recent_data = forecasts[h-self.config.n_lags:h]
-                x_h = np.concatenate([np.array([1]), recent_data.flatten()])
+                # Prediction step
+                beta_pred = beta_mean[t-1]  # Random walk assumption
+                P_pred = beta_var[t-1] + Q_beta
+                h_pred = h_mean[t-1]  # Random walk for log volatilities
             
-            # Point forecast
-            forecast_h = x_h @ beta_current
-            forecasts[h] = forecast_h
+            # Current volatility
+            sigma_t = np.diag(np.exp(h_pred))
+            sigma[t] = sigma_t
             
-            # Forecast variance (simplified)
-            H_h = np.kron(x_h.reshape(1, -1), np.eye(self.n_vars))
-            forecast_var_h = (
-                H_h @ self.parameter_variance @ H_h.T + 
-                self.current_variance
-            )
-            forecast_variances[h] = forecast_var_h
+            # Prediction error
+            y_pred = X_t @ beta_pred
+            v_t = y_t - y_pred
+            
+            # Prediction error covariance
+            F_t = X_t @ P_pred @ X_t.T + sigma_t
+            
+            # Update step (if F_t is invertible)
+            try:
+                F_inv = linalg.inv(F_t)
+                K_t = P_pred @ X_t.T @ F_inv
+                
+                # Updated estimates
+                beta_mean[t] = beta_pred + K_t @ v_t
+                beta_var[t] = P_pred - K_t @ X_t @ P_pred
+                
+                # Log likelihood contribution
+                log_likelihood += -0.5 * (
+                    n * np.log(2 * np.pi) + 
+                    np.log(linalg.det(F_t)) + 
+                    v_t.T @ F_inv @ v_t
+                )
+                
+            except linalg.LinAlgError:
+                # If F_t is singular, use prediction
+                beta_mean[t] = beta_pred
+                beta_var[t] = P_pred
+                self.logger.warning(f"Singular covariance matrix at time {t}")
+            
+            # Update volatility (simplified approach)
+            # In practice, this would use particle filter or MCMC
+            if t > 0:
+                # Simple exponential smoothing of squared residuals
+                alpha_vol = 0.1
+                log_squared_resid = np.log(np.maximum(v_t**2, 1e-8))
+                h_mean[t] = (1 - alpha_vol) * h_mean[t-1] + alpha_vol * log_squared_resid
+            else:
+                h_mean[t] = h_pred
         
-        # Confidence intervals
-        from scipy.stats import chi2
-        chi2_val = chi2.ppf(confidence_level, self.n_vars)
-        
-        confidence_intervals = np.zeros((steps_ahead, self.n_vars, 2))
-        for h in range(steps_ahead):
-            std_errors = np.sqrt(np.diag(forecast_variances[h]))
-            confidence_intervals[h, :, 0] = forecasts[h] - chi2_val * std_errors
-            confidence_intervals[h, :, 1] = forecasts[h] + chi2_val * std_errors
-        
-        # Transform back to original scale
-        forecasts_orig = self.scaler.inverse_transform(forecasts)
+        # Reshape parameters back to matrix form
+        parameters = {}
+        for t in range(T):
+            beta_matrix = beta_mean[t].reshape((k, n))
+            parameters[t] = {
+                'coefficients': beta_matrix,
+                'covariance': sigma[t],
+                'log_volatility': h_mean[t]
+            }
         
         return {
-            'forecasts': forecasts_orig,
-            'forecast_variances': forecast_variances,
-            'confidence_intervals': confidence_intervals,
-            'parameters': beta_current,
-            'parameter_variance': self.parameter_variance
+            'parameters': parameters,
+            'volatility': h_mean,
+            'log_likelihood': log_likelihood,
+            'beta_mean': beta_mean,
+            'beta_var': beta_var
         }
     
-    def get_time_varying_parameters(self, variable_names: Optional[List[str]] = None) -> pd.DataFrame:
+    def _calculate_diagnostics(self, Y: np.ndarray, X: np.ndarray, results: Dict) -> Dict[str, float]:
         """
-        Get time-varying parameter estimates as DataFrame
+        Calculate model diagnostics and goodness-of-fit measures.
         
         Args:
-            variable_names: Names of variables for labeling
+            Y: Dependent variable matrix
+            X: Independent variable matrix
+            results: Model estimation results
             
         Returns:
-            DataFrame with parameter evolution over time
+            Dictionary with diagnostic statistics
         """
-        if not self.parameter_history:
-            return pd.DataFrame()
+        T, n = Y.shape
+        k = X.shape[1]
         
-        # Create parameter matrix
-        param_matrix = np.array(self.parameter_history)
+        # Calculate fitted values and residuals
+        fitted_values = np.zeros_like(Y)
+        residuals = np.zeros_like(Y)
         
-        # Create column names
-        if variable_names is None:
-            variable_names = [f'Var_{i}' for i in range(self.n_vars)]
+        for t in range(T):
+            x_t = X[t, :]
+            beta_t = results['parameters'][t]['coefficients']
+            fitted_values[t, :] = x_t @ beta_t
+            residuals[t, :] = Y[t, :] - fitted_values[t, :]
         
-        columns = ['Constant']
-        for lag in range(1, self.config.n_lags + 1):
-            for var_name in variable_names:
-                columns.append(f'{var_name}_L{lag}')
+        # R-squared (time-varying)
+        ss_res = np.sum(residuals**2, axis=0)
+        ss_tot = np.sum((Y - np.mean(Y, axis=0))**2, axis=0)
+        r_squared = 1 - (ss_res / ss_tot)
         
-        # Repeat for each equation
-        all_columns = []
-        for eq_var in variable_names:
-            for col in columns:
-                all_columns.append(f'{eq_var}_{col}')
+        # Information criteria
+        n_params = n * k * T  # Approximate (parameters vary over time)
+        aic = -2 * results['log_likelihood'] + 2 * n_params
+        bic = -2 * results['log_likelihood'] + np.log(T) * n_params
         
-        return pd.DataFrame(param_matrix, columns=all_columns[:param_matrix.shape[1]])
+        # Durbin-Watson statistic for residual autocorrelation
+        dw_stats = []
+        for i in range(n):
+            resid_diff = np.diff(residuals[:, i])
+            dw = np.sum(resid_diff**2) / np.sum(residuals[1:, i]**2)
+            dw_stats.append(dw)
+        
+        # Parameter stability (variance of parameter changes)
+        param_stability = []
+        for i in range(n):
+            for j in range(k):
+                param_series = [results['parameters'][t]['coefficients'][j, i] for t in range(T)]
+                param_stability.append(np.var(param_series))
+        
+        return {
+            'r_squared': r_squared.tolist(),
+            'mean_r_squared': np.mean(r_squared),
+            'aic': aic,
+            'bic': bic,
+            'log_likelihood': results['log_likelihood'],
+            'durbin_watson': dw_stats,
+            'parameter_stability': np.mean(param_stability),
+            'residual_std': np.std(residuals, axis=0).tolist()
+        }
     
-    def calculate_regime_probabilities(self, window: int = 50) -> np.ndarray:
+    def predict(self, 
+                data: pd.DataFrame,
+                horizon: int = 10,
+                confidence_level: float = 0.95) -> Dict[str, any]:
         """
-        Calculate regime probabilities based on parameter stability
+        Generate predictions using the fitted TVP-VAR model.
         
         Args:
-            window: Rolling window for regime detection
+            data: Recent data for prediction
+            horizon: Number of periods to forecast
+            confidence_level: Confidence level for prediction intervals
             
         Returns:
-            Array of regime probabilities
-        """
-        if len(self.parameter_history) < window:
-            return np.ones(len(self.parameter_history))
-        
-        # Calculate parameter volatility
-        param_array = np.array(self.parameter_history)
-        regime_probs = np.zeros(len(self.parameter_history))
-        
-        for t in range(window, len(self.parameter_history)):
-            # Parameter changes in window
-            param_window = param_array[t-window:t]
-            param_volatility = np.std(param_window, axis=0)
-            
-            # Regime probability (low volatility = stable regime)
-            stability_score = 1 / (1 + np.mean(param_volatility))
-            regime_probs[t] = stability_score
-        
-        return regime_probs
-    
-    def get_impulse_responses(self, 
-                            shock_size: float = 1.0, 
-                            periods: int = 20) -> np.ndarray:
-        """
-        Calculate impulse response functions using current parameters
-        
-        Args:
-            shock_size: Size of the shock (standard deviations)
-            periods: Number of periods for impulse response
-            
-        Returns:
-            Impulse response matrix (periods x n_vars x n_vars)
+            Dictionary with predictions and confidence intervals
         """
         if not self.is_fitted:
-            raise ValueError("Model must be fitted before calculating impulse responses")
+            raise ValueError("Model must be fitted before prediction")
         
-        # Current parameter matrix
-        beta = self.current_parameters.reshape(self.n_params, self.n_vars)
+        self.logger.info(f"Generating {horizon}-period predictions")
         
-        # Extract autoregressive coefficients (excluding constant)
-        A_matrices = []
-        for lag in range(self.config.n_lags):
-            start_idx = 1 + lag * self.n_vars
-            end_idx = 1 + (lag + 1) * self.n_vars
-            A_matrices.append(beta[start_idx:end_idx, :].T)
+        # Prepare data
+        recent_data = data[self.target_columns].tail(50)  # Use recent 50 observations
+        if len(recent_data) < self.lags:
+            raise ValueError(f"Need at least {self.lags} observations for prediction")
         
-        # Cholesky decomposition of error covariance
-        try:
-            P = np.linalg.cholesky(self.current_variance)
-        except np.linalg.LinAlgError:
-            # If not positive definite, use eigenvalue decomposition
-            eigenvals, eigenvecs = np.linalg.eigh(self.current_variance)
-            eigenvals = np.maximum(eigenvals, 1e-8)
-            P = eigenvecs @ np.diag(np.sqrt(eigenvals)) @ eigenvecs.T
+        # Scale data using fitted scaler
+        recent_scaled = pd.DataFrame(
+            self.scaler.transform(recent_data),
+            index=recent_data.index,
+            columns=recent_data.columns
+        )
         
-        # Initialize impulse response
-        impulse_responses = np.zeros((periods, self.n_vars, self.n_vars))
+        # Get latest parameters (from last fitted period)
+        latest_params = self.parameters[len(self.parameters) - 1]
+        beta = latest_params['coefficients']
+        sigma = latest_params['covariance']
         
-        # Initial impact (Cholesky decomposition)
-        impulse_responses[0] = P * shock_size
+        # Initialize prediction
+        predictions = []
+        prediction_vars = []
         
-        # Calculate responses for subsequent periods
-        for t in range(1, periods):
-            response_t = np.zeros((self.n_vars, self.n_vars))
+        # Use last observations as initial conditions
+        last_obs = recent_scaled.tail(self.lags).values
+        current_state = last_obs.flatten()
+        
+        for h in range(horizon):
+            # Create prediction input
+            if h == 0:
+                # Use actual lagged values
+                x_pred = np.concatenate([[1], current_state])  # Add constant
+            else:
+                # Use predicted values for longer horizons
+                x_pred = np.concatenate([[1], 
+                    np.concatenate([pred.flatten() for pred in predictions[-self.lags:]])])
             
-            for lag in range(min(t, self.config.n_lags)):
-                response_t += A_matrices[lag] @ impulse_responses[t - lag - 1]
+            # Ensure correct dimensions
+            x_pred = x_pred[:beta.shape[0]]
             
-            impulse_responses[t] = response_t
+            # Point prediction
+            y_pred = x_pred @ beta
+            predictions.append(y_pred)
+            
+            # Prediction variance (approximation)
+            pred_var = np.diag(sigma)
+            prediction_vars.append(pred_var)
+            
+            # Update state for next prediction
+            if h < self.lags - 1:
+                current_state = np.concatenate([
+                    y_pred.flatten(),
+                    current_state[:-len(y_pred)]
+                ])
+        
+        # Convert to arrays
+        predictions = np.array(predictions)
+        prediction_vars = np.array(prediction_vars)
+        
+        # Transform back to original scale
+        predictions_original = self.scaler.inverse_transform(predictions)
+        
+        # Calculate confidence intervals (approximate)
+        alpha = 1 - confidence_level
+        z_score = 1.96  # Approximate for 95% confidence
+        
+        prediction_std = np.sqrt(prediction_vars)
+        prediction_std_original = prediction_std * self.scaler.scale_
+        
+        lower_bound = predictions_original - z_score * prediction_std_original
+        upper_bound = predictions_original + z_score * prediction_std_original
+        
+        # Create prediction DataFrame
+        future_dates = pd.date_range(
+            start=recent_data.index[-1] + pd.Timedelta(days=1),
+            periods=horizon,
+            freq='D'
+        )
+        
+        predictions_df = pd.DataFrame(
+            predictions_original,
+            index=future_dates,
+            columns=self.target_columns
+        )
+        
+        lower_df = pd.DataFrame(
+            lower_bound,
+            index=future_dates,
+            columns=[f"{col}_lower" for col in self.target_columns]
+        )
+        
+        upper_df = pd.DataFrame(
+            upper_bound,
+            index=future_dates,
+            columns=[f"{col}_upper" for col in self.target_columns]
+        )
+        
+        return {
+            'predictions': predictions_df,
+            'lower_bound': lower_df,
+            'upper_bound': upper_df,
+            'confidence_level': confidence_level,
+            'prediction_variance': prediction_vars,
+            'model_params': latest_params
+        }
+    
+    def get_parameter_evolution(self) -> pd.DataFrame:
+        """
+        Get the evolution of model parameters over time.
+        
+        Returns:
+            DataFrame with parameter evolution
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted first")
+        
+        param_data = []
+        
+        for t, params in self.parameters.items():
+            beta = params['coefficients']
+            log_vol = params['log_volatility']
+            
+            # Flatten coefficient matrix and add to record
+            for i, col in enumerate(self.target_columns):
+                for j in range(beta.shape[0]):
+                    param_data.append({
+                        'time_index': t,
+                        'variable': col,
+                        'lag_or_const': j,
+                        'coefficient': beta[j, i],
+                        'log_volatility': log_vol[i]
+                    })
+        
+        return pd.DataFrame(param_data)
+    
+    def calculate_impulse_responses(self, 
+                                  horizon: int = 20,
+                                  shock_size: float = 1.0) -> Dict[str, np.ndarray]:
+        """
+        Calculate impulse response functions for the latest time period.
+        
+        Args:
+            horizon: Number of periods for impulse responses
+            shock_size: Size of the shock (in standard deviations)
+            
+        Returns:
+            Dictionary with impulse response matrices
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted first")
+        
+        # Use latest parameters
+        latest_params = self.parameters[len(self.parameters) - 1]
+        beta = latest_params['coefficients']
+        sigma = latest_params['covariance']
+        
+        n_vars = len(self.target_columns)
+        
+        # Extract coefficient matrices for each lag
+        coef_matrices = []
+        for lag in range(self.lags):
+            start_idx = 1 + lag * n_vars  # Skip constant
+            end_idx = start_idx + n_vars
+            if end_idx <= beta.shape[0]:
+                coef_matrices.append(beta[start_idx:end_idx, :])
+        
+        # Create companion form
+        companion_size = self.lags * n_vars
+        companion = np.zeros((companion_size, companion_size))
+        
+        # Fill in coefficient matrices
+        for i, coef_matrix in enumerate(coef_matrices):
+            companion[:n_vars, i*n_vars:(i+1)*n_vars] = coef_matrix.T
+        
+        # Identity matrix for lags
+        if self.lags > 1:
+            companion[n_vars:, :-n_vars] = np.eye((self.lags-1) * n_vars)
+        
+        # Calculate impulse responses
+        impulse_responses = {}
+        
+        for shock_var_idx in range(n_vars):
+            # Create shock vector
+            shock = np.zeros(companion_size)
+            shock[shock_var_idx] = shock_size * np.sqrt(sigma[shock_var_idx, shock_var_idx])
+            
+            # Propagate shock
+            responses = np.zeros((horizon, n_vars))
+            current_state = shock.copy()
+            
+            for h in range(horizon):
+                # Extract response for original variables
+                responses[h, :] = current_state[:n_vars]
+                
+                # Update state
+                current_state = companion @ current_state
+            
+            shock_var_name = self.target_columns[shock_var_idx]
+            impulse_responses[shock_var_name] = responses
         
         return impulse_responses
+
+    def forecast_error_variance_decomposition(self, horizon: int = 20) -> pd.DataFrame:
+        """
+        Calculate forecast error variance decomposition.
+        
+        Args:
+            horizon: Forecast horizon for decomposition
+            
+        Returns:
+            DataFrame with variance decomposition results
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted first")
+        
+        # Calculate impulse responses
+        impulse_responses = self.calculate_impulse_responses(horizon)
+        
+        n_vars = len(self.target_columns)
+        fevd_results = []
+        
+        for target_var_idx, target_var in enumerate(self.target_columns):
+            for h in range(1, horizon + 1):
+                # Calculate cumulative squared impulse responses
+                total_variance = 0
+                variance_contributions = {}
+                
+                for shock_var in self.target_columns:
+                    cumulative_response = np.sum(
+                        impulse_responses[shock_var][:h, target_var_idx] ** 2
+                    )
+                    variance_contributions[shock_var] = cumulative_response
+                    total_variance += cumulative_response
+                
+                # Convert to percentages
+                for shock_var in self.target_columns:
+                    if total_variance > 0:
+                        contribution_pct = (
+                            variance_contributions[shock_var] / total_variance * 100
+                        )
+                    else:
+                        contribution_pct = 0
+                    
+                    fevd_results.append({
+                        'target_variable': target_var,
+                        'shock_variable': shock_var,
+                        'horizon': h,
+                        'contribution_percent': contribution_pct
+                    })
+        
+        return pd.DataFrame(fevd_results)
